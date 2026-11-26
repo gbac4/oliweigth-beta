@@ -1,0 +1,464 @@
+'use strict';
+/* OliWeight — budget de calories personnalisé et nombre de repas (fiche #21)
+   Calcul local, sans IA, avec les méthodes utilisées par les diététistes :
+   1. dépense au repos : Mifflin-St Jeor (Academy of Nutrition and Dietetics), poids de la dernière pesée ;
+   2. × facteur d'activité ;
+   3. + allaitement : +330 kcal (0-6 mois), +400 (7 mois et +), moitié si allaitement partiel (ANREF) ;
+   4. − déficit = perte visée × 7 700 / 7, plafonné à 25 % des besoins et à 500 kcal en allaitement ;
+   5. jamais sous le plancher (kcalMin), pas de déficit en pause ou grossesse.
+   La formule est une estimation (±10 %) : la tendance des pesées sert ensuite à ajuster. */
+const ACTIVITY = {sedentaire: 1.2, legere: 1.375, moderee: 1.55, elevee: 1.725};
+const KCAL_PER_KG = 7700;
+const ADJ_MAX = 300; // ajustement cumulé maximal, en plus ou en moins
+// Moments gardés selon le nombre de repas : 0 petit-déj, 1 collation 11 h, 2 dîner, 3 collation 15 h 30, 4 souper
+const MEAL_SLOTS = {5: [0, 1, 2, 3, 4], 4: [0, 2, 3, 4], 3: [0, 2, 4]};
+// Part de la journée par moment (calculateur de portion) selon le nombre de repas
+const SLOT_SHARES = {
+  5: {P: 0.25, C: 0.075, D: 0.3, S: 0.3},
+  4: {P: 0.25, C: 0.1, D: 0.35, S: 0.3},
+  3: {P: 0.3, C: 0.1, D: 0.35, S: 0.35},
+};
+function clamp(v, a, b) {
+  return Math.min(b, Math.max(a, v));
+}
+function currentWeight() {
+  const w = [...(data.weights || [])].filter((x) => num(x.kg) >= 30).sort((a, b) => (a.date < b.date ? -1 : 1));
+  return w.length ? num(w[w.length - 1].kg) : num(data.settings.startWeight);
+}
+// Détail du calcul, ou null si le profil ne suffit pas (on garde alors l'ancien fonctionnement)
+function energyBreakdown() {
+  const p = prof(),
+    w = currentWeight(),
+    h = num(p.taille),
+    a = num(p.age);
+  if (!(p.sexe === 'F' || p.sexe === 'H') || !(w >= 30) || !(h >= 120) || !(a >= 18)) return null;
+  const bmr = 10 * w + 6.25 * h - 5 * a + (p.sexe === 'H' ? 5 : -161),
+    act = ACTIVITY[p.activite] || 1.2,
+    tdee = bmr * act,
+    lact = isBreastfeeding() ? (p.bebeAge === '7+' ? 400 : 330) * (p.allaitementType === 'partiel' ? 0.5 : 1) : 0,
+    maint = tdee + lact,
+    paused = isPaused(),
+    deficit = paused ? 0 : Math.min((weeklyLoss() * KCAL_PER_KG) / 7, maint * 0.25, isBreastfeeding() ? 500 : 1000),
+    adj = paused ? 0 : clamp(num(data.settings.kcalAdjust), -ADJ_MAX, ADJ_MAX),
+    raw = maint - deficit + adj,
+    target = Math.max(kcalMin(), Math.round(raw / 10) * 10);
+  return {w, bmr, act, tdee, lact, maint, deficit, adj, target, floored: raw < kcalMin()};
+}
+// Perte réaliste (kg/sem) si on mange au minimum sûr : quand l'objectif demandé est trop rapide
+function realisticLoss() {
+  const e = energyBreakdown();
+  if (!e || !e.floored) return null;
+  return Math.max(0, Math.round((((e.maint - kcalMin()) * 7) / KCAL_PER_KG) * 20) / 20);
+}
+function kcalTarget() {
+  const e = energyBreakdown();
+  return e ? e.target : null;
+}
+function energyText() {
+  const e = energyBreakdown();
+  if (!e)
+    return 'Complète sexe, âge, taille et poids dans ton profil pour un budget calculé pour toi. En attendant, la limite manuelle ci-dessous s’applique.';
+  const parts = [
+    `repos ${fmtK(e.bmr)} × activité ${fr(e.act, 3)} = ${fmtK(e.tdee)}`,
+    e.lact ? `+ allaitement ${fmtK(e.lact)}` : '',
+    e.deficit ? `− perte visée ${fmtK(e.deficit)}` : '',
+    e.adj ? `${e.adj > 0 ? '+' : '−'} ajustement ${fmtK(Math.abs(e.adj))}` : '',
+  ].filter(Boolean);
+  const rl = realisticLoss(),
+    slow =
+      rl !== null
+        ? ` Ton objectif de ${fr(weeklyLoss(), 2)} kg par semaine est trop rapide pour ton profil : au minimum sûr, le rythme réaliste est d’environ ${fr(rl, 2)} kg par semaine.`
+        : '';
+  return `Calculé pour toi : ${fmtK(e.target)} kcal par jour (${parts.join(' ')}${e.floored ? ` ; remonté au minimum de ${fmtK(kcalMin())}` : ''}). Poids utilisé : ${fr(e.w)} kg, recalculé à chaque pesée.${slow}`;
+}
+/* ---------- Nombre de repas ---------- */
+function defaultMealCount() {
+  const n = num(prof().repas);
+  return n === 3 || n === 4 ? n : 5;
+}
+function mealCount(date) {
+  const o = num(data.logs[date]?.mealCount);
+  return o === 3 || o === 4 || o === 5 ? o : defaultMealCount();
+}
+function activeSlots(date) {
+  return MEAL_SLOTS[mealCount(date)];
+}
+// Total visé du jour : budget personnalisé, sinon les 5 repas prévus (rien ne change pour l'ancien fonctionnement)
+function dayGoal(date) {
+  const g = kcalTarget() ?? effCodes(date).reduce((t, c) => t + kcalOf(c), 0);
+  // fiche #40 : un excédent des jours précédents est étalé ici, sans jamais passer sous le minimum
+  const c = carryIn(date);
+  return c ? Math.max(kcalMin(), g - c) : g;
+}
+// Facteur de portion appliqué aux repas gardés pour que le jour atteigne son total (0,6 à 1,6, pas de 0,05)
+function portionFactor(date) {
+  const kept = activeSlots(date).reduce((t, i) => t + mealBaseKcal(date, i), 0);
+  if (!(kept > 0)) return 1;
+  const f = Math.round(clamp(dayGoal(date) / kept, 0.6, 1.6) * 20) / 20;
+  return Math.abs(f - 1) < 0.05 ? 1 : f;
+}
+function slotKcal(date, i, code) {
+  const c = code || effCode(date, i),
+    red = num(data.logs[date]?.rebal?.[i]);
+  if (isCustomCode(c))
+    return altMode(date, i) !== 'fit'
+      ? partsKcal(c, altParts(date, i))
+      : Math.round(plannedKcal(date, i) * portionFactor(date)) - red;
+  return Math.round(kcalOf(c) * portionFactor(date)) - red;
+}
+// facteur des quantités écrites d'un repas (portion du jour et rééquilibrage)
+function mealScale(date, i, code) {
+  const k = kcalOf(code || effCode(date, i));
+  return k > 0 ? slotKcal(date, i, code) / k : 1;
+}
+function slotShare(slot, date) {
+  return SLOT_SHARES[mealCount(date || todayISO())][slot] || 0.3;
+}
+/* ---------- Ajustement selon la tendance des pesées ---------- */
+// Pente des pesées (régression linéaire) sur 28 jours, hors 2 premières semaines (eau et glycogène)
+function weightTrend(today = todayISO()) {
+  const start = shiftDate(data.settings.startDate || '2000-01-01', 14),
+    from = shiftDate(today, -28),
+    pts = (data.weights || [])
+      .filter((x) => x.date >= from && x.date >= start && x.date <= today && num(x.kg) >= 30)
+      .map((x) => [(new Date(x.date) - new Date(from)) / 864e5, num(x.kg)]);
+  if (pts.length < 3) return null;
+  const span = Math.max(...pts.map((p) => p[0])) - Math.min(...pts.map((p) => p[0]));
+  if (span < 21) return null;
+  const n = pts.length,
+    mx = pts.reduce((t, p) => t + p[0], 0) / n,
+    my = pts.reduce((t, p) => t + p[1], 0) / n,
+    sxy = pts.reduce((t, p) => t + (p[0] - mx) * (p[1] - my), 0),
+    sxx = pts.reduce((t, p) => t + (p[0] - mx) ** 2, 0);
+  return {loss: Math.round(-(sxy / sxx) * 7 * 100) / 100, n, span};
+}
+function kcalSuggestion(today = todayISO()) {
+  const e = energyBreakdown();
+  if (!e || isPaused()) return null;
+  const last = data.settings.kcalAdjustAt;
+  if (last && last > shiftDate(today, -21)) return null;
+  const t = weightTrend(today);
+  if (!t) return null;
+  if (goal() === 'stabiliser') {
+    if (t.loss > 0.25) return {delta: 100, loss: t.loss, why: 'stab-down'};
+    if (t.loss < -0.25) return {delta: -100, loss: t.loss, why: 'stab-up'};
+    return null;
+  }
+  const target = weeklyLoss();
+  if (t.loss > maxLoss() + 0.1) return {delta: 150, loss: t.loss, why: 'fast'};
+  if (target > 0 && t.loss < target - 0.2) {
+    if (e.target - 100 < kcalMin() || e.adj - 100 < -ADJ_MAX) return {delta: 0, loss: t.loss, why: 'floor'};
+    return {delta: -100, loss: t.loss, why: 'slow'};
+  }
+  return null;
+}
+function suggestionCard() {
+  const s = kcalSuggestion();
+  if (!s) return '';
+  const lost = `${s.loss >= 0 ? '−' : '+'}${fr(Math.abs(s.loss), 2)} kg par semaine`,
+    goalTxt = `${fr(weeklyLoss(), 2)} kg visés`;
+  if (s.why === 'floor')
+    return `<div class="alert info"><b>Rythme plus lent que prévu</b> (${lost}, ${goalTxt}). Ton budget est déjà au minimum sûr : on ne baisse pas. Ajoute de la marche, vérifie les extras et les portions, ou parles-en à une diététiste. <button data-kadj="0" style="margin-top:8px;width:100%">Compris</button></div>`;
+  const txt =
+    s.why === 'stab-down' || s.why === 'stab-up'
+      ? `Sur les 4 dernières semaines : ${lost}, alors que tu veux stabiliser. Je propose <b>${s.delta > 0 ? '+' : ''}${s.delta} kcal par jour</b>.`
+      : s.why === 'fast'
+        ? `Tu perds plus vite que le maximum sûr (${lost}). Je propose <b>+${s.delta} kcal par jour</b>.`
+        : `Sur les 4 dernières semaines : ${lost}, pour ${goalTxt}. Je propose <b>${s.delta} kcal par jour</b>.`;
+  return `<div class="alert info"><b>Ajuster mon budget ?</b> ${txt} <span class="small muted">Prochaine vérification dans 3 semaines.</span><div class="row wrap" style="margin-top:8px"><button class="primary grow" data-kadj="${s.delta}">Oui, ajuster</button><button data-kadj="0">Pas maintenant</button></div></div>`;
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-kadj]');
+  if (b) {
+    const d = num(b.dataset.kadj);
+    data.settings.kcalAdjust = clamp(num(data.settings.kcalAdjust) + d, -ADJ_MAX, ADJ_MAX);
+    data.settings.kcalAdjustAt = todayISO();
+    save();
+    renderAll();
+    if (d) toast(`Budget ajusté de ${d > 0 ? '+' : ''}${d} kcal par jour.`);
+    return;
+  }
+  const m = e.target.closest('[data-mealcount]');
+  if (m) {
+    const l = logFor(selectedDate),
+      n = num(m.dataset.mealcount);
+    if (n === defaultMealCount()) delete l.mealCount;
+    else l.mealCount = n;
+    save();
+    renderToday();
+  }
+});
+
+/* ---------- Quantités écrites recalculées (fiche #27) ----------
+   Les menus sont en texte libre : on réécrit seulement les quantités au format connu.
+   Arrondi vers le bas (perte de poids), au plus proche si le budget est déjà au plancher. */
+const FRAC = {'¼': 0.25, '½': 0.5, '¾': 0.75};
+const FRAC_TXT = {0.25: '¼', 0.5: '½', 0.75: '¾'};
+const PIECES = 'œufs?|oeufs?|tranches?|bananes?|plantains?|pommes?|oranges?|galettes?|biscottes?|dattes?|pains?';
+function roundStep(v, step, mode) {
+  const r = mode === 'near' ? Math.round(v / step) : Math.floor(v / step + 1e-9);
+  return Math.max(step, r * step);
+}
+function fracText(v) {
+  const w = Math.floor(v),
+    f = FRAC_TXT[Math.round((v - w) * 100) / 100] || '';
+  return w ? `${w}${f ? ' ' + f : ''}` : f;
+}
+function roundMode(date) {
+  return dayGoal(date) <= kcalMin() * 1.03 ? 'near' : 'down';
+}
+function scaleText(text, f, mode = 'down') {
+  if (!text || f === 1) return text;
+  return (
+    String(text)
+      // grammes, ml : au 5 près
+      .replace(
+        /(\d+(?:[.,]\d+)?)(\s?)(g|ml)\b/g,
+        (all, n, sp, u) => `${roundStep(num(n.replace(',', '.')) * f, 5, mode)}${sp}${u}`,
+      )
+      // tasses et cuillères : au ¼ près
+      .replace(
+        /((?:\d+\s)?[¼½¾]|\d+(?:[.,]\d+)?)(\s(?:de\s)?)(tasses?|c\. à soupe|c\. à thé)/g,
+        (all, n, mid, u, off, str) => {
+          // grammes précisés juste après : la tasse suit au plus proche, pour rester cohérente avec eux
+          const m2 = /^[^()]{0,40}\(\d+\s?g\)/.test(str.slice(off + all.length)) ? 'near' : mode;
+          const v = n
+            .trim()
+            .split(/\s+/)
+            .reduce((t, x) => t + (FRAC[x] ?? num(x.replace(',', '.'))), 0);
+          const s = roundStep(v * f, 0.25, m2),
+            unit = u.startsWith('tasse') ? (s > 1 ? 'tasses' : 'tasse') : u;
+          return `${fracText(s)}${s < 1 ? mid : ' '}${unit}`;
+        },
+      )
+      // pièces : nombre entier
+      .replace(new RegExp(`\\b(\\d+)(\\s)(${PIECES})\\b`, 'g'), (all, n, sp, u) => {
+        const s = Math.max(1, mode === 'near' ? Math.round(num(n) * f) : Math.floor(num(n) * f + 1e-9));
+        return `${s}${sp}${s > 1 && !/s$/.test(u) ? u + 's' : s === 1 && /s$/.test(u) ? u.slice(0, -1) : u}`;
+      })
+      // nombre approximatif entre parenthèses, ex. « (environ 12) » amandes
+      .replace(
+        /\(environ (\d+)\)/g,
+        (all, n) => `(environ ${Math.max(1, mode === 'near' ? Math.round(num(n) * f) : Math.floor(num(n) * f))})`,
+      )
+  );
+}
+
+/* ---------- Objectif « stabiliser » (fiche #34) ----------
+   Budget = besoins (pas de déficit). On suit une fourchette de ±1 kg autour d'un poids de référence :
+   le poids varie normalement de 1 à 2 kg d'un jour à l'autre (eau, sel, cycle). */
+const STAB_RANGE = 1;
+function stabWeight() {
+  return num(data.settings.stabWeight) || num(data.settings.startWeight);
+}
+function stabRange() {
+  const w = stabWeight();
+  return w ? [Math.round((w - STAB_RANGE) * 10) / 10, Math.round((w + STAB_RANGE) * 10) / 10] : null;
+}
+function switchToStabilize(w) {
+  data.profile = {...(data.profile || {}), objectif: 'stabiliser'};
+  data.settings.stabWeight = Math.round(num(w || currentWeight()) * 10) / 10;
+  data.settings.kcalAdjust = 0;
+  data.settings.kcalAdjustAt = todayISO();
+  save();
+  renderAll();
+  toast('Objectif : stabiliser ton poids.');
+}
+// En mode « perdre », poids visé atteint → proposer de stabiliser. En mode « stabiliser », hors fourchette → le dire.
+function stabBanner() {
+  const s = data.settings,
+    cur = currentWeight();
+  if (goal() === 'perdre') {
+    const tw = num(s.targetWeight);
+    if (!(tw >= 30) || !(cur > 0) || cur > tw || s.stabOfferDismissed === tw) return '';
+    return `<div class="alert">🎉 Tu as atteint ton poids visé (${fr(tw)} kg) ! On passe à l’objectif <b>stabiliser</b> : tu manges selon tes besoins et l’app surveille une fourchette de ±1 kg.<div class="row wrap" style="margin-top:8px"><button class="primary grow" data-goal-stab>Oui, stabiliser</button><button data-goal-stab-no>Continuer à perdre</button></div></div>`;
+  }
+  const r = stabRange();
+  if (!r || !(data.weights || []).length) return '';
+  if (cur > r[1])
+    return `<div class="alert">⚖️ Ton poids (${fr(cur)} kg) est au-dessus de ta fourchette (${fr(r[0])} à ${fr(r[1])} kg). Pas d’inquiétude pour une pesée : regarde la tendance sur 2 à 3 semaines.</div>`;
+  if (cur < r[0])
+    return `<div class="alert">⚖️ Ton poids (${fr(cur)} kg) est sous ta fourchette (${fr(r[0])} à ${fr(r[1])} kg). Si ça continue, mange un peu plus : l’app te proposera un ajustement.</div>`;
+  return '';
+}
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-goal-stab]')) switchToStabilize();
+  if (e.target.closest('[data-goal-stab-no]')) {
+    data.settings.stabOfferDismissed = num(data.settings.targetWeight);
+    save();
+    renderAll();
+  }
+});
+
+/* ---------- « Mes recettes » en remplacement et rééquilibrage (fiche #40) ----------
+   A (« fit », par défaut) : la portion de la recette est calculée pour les calories du repas prévu.
+   B (« full ») : la portion complète ; l'excédent est retiré des repas pas encore notés (15 % au plus chacun),
+   sous 100 kcal on ne fait rien, et le reste est étalé sur les 3 jours suivants (100 kcal par jour au plus).
+   Les réductions sont enregistrées au moment du choix : un repas noté ensuite ne change plus. */
+const REBAL_TOL = 100,
+  REBAL_MAX = 0.15,
+  CARRY_DAYS = 3,
+  CARRY_MAX = 100;
+function isCustomCode(c) {
+  return !!(typeof data !== 'undefined' && data.customRecipes && data.customRecipes[c]);
+}
+// « fit » (portion ajustée) ou un nombre de parts de la marmite : « p0.5 », « p1 », « p1.5 », « p2 »
+const PARTS_CHOICES = [0.5, 1, 1.5, 2];
+function altMode(date, i) {
+  const m = data.logs[date]?.altMode?.[i];
+  return m === 'full' ? 'p1' : /^p[\d.]+$/.test(m || '') ? m : 'fit';
+}
+function altParts(date, i) {
+  return num(altMode(date, i).slice(1)) || 1;
+}
+function partsLabel(n) {
+  return `${n === 0.5 ? '½' : n === 1.5 ? '1 ½' : String(n)} part${n > 1 ? 's' : ''}`;
+}
+// n parts de la marmite (nombre de parts de la recette) + l'accompagnement habituel, une seule fois
+function partsKcal(c, n) {
+  const r = data.customRecipes[c],
+    t = recipeTotals(r),
+    side = r.sauce ? FOODS[r.side || 'taro'] : null,
+    sideK = side ? (side.units[1][1] * side.kcal) / 100 : 0,
+    // sans nombre de parts (seulement le poids cuit), une part = la portion standard de sauce
+    part = t.perPart > 0 ? t.perPart : customAsMeal(c, r).kcal * (r.sauce ? 2 / 3 : 1);
+  return Math.round(n * part + sideK);
+}
+function plannedKcal(date, i) {
+  return kcalOf(planFor(date)[i]);
+}
+function customFullKcal(c) {
+  return partsKcal(c, 1);
+}
+// calories de base d'un repas avant le facteur du jour (une recette perso compte pour le repas prévu)
+function mealBaseKcal(date, i) {
+  const c = effCode(date, i);
+  return isCustomCode(c) ? plannedKcal(date, i) : kcalOf(c);
+}
+function customOptions(i) {
+  const ex = profileExclusions(data.profile);
+  return recipeBank().filter((r) => r.custom && r.moment === SLOT_MOMENT[i] && isCompatible(r, ex));
+}
+/* Ordre de compensation (fiche #40, décidé avec Bertrand) :
+   1. sous 100 kcal, rien ; 2. s'il reste une collation, proposer de la sauter (ou de la réduire de moitié ;
+   en allaitement, seulement réduire) ; 3. repas principaux restants −15 % au plus ; 4. étalement sur 3 jours,
+   100 kcal par jour au plus ; 5. le reste est affiché, pas compensé. Jamais de repas principal sauté. */
+function computeRebalance(date) {
+  const l = logFor(date),
+    act = activeSlots(date),
+    pf = portionFactor(date),
+    noted = (i) => !!l.meals?.[i]?.status,
+    isFull = (i) => isCustomCode(effCode(date, i)) && altMode(date, i) !== 'fit';
+  let extra = act
+    .filter(isFull)
+    .reduce((t, i) => t + partsKcal(effCode(date, i), altParts(date, i)) - Math.round(plannedKcal(date, i) * pf), 0);
+  // les réductions déjà faites sur des repas notés restent acquises
+  const out = {};
+  Object.entries(l.rebal || {}).forEach(([i, v]) => {
+    if (noted(i)) {
+      out[i] = v;
+      extra -= v;
+    }
+  });
+  let left = 0;
+  delete l.snackOffer;
+  if (extra > REBAL_TOL) {
+    // collations restantes : selon le choix de la personne
+    const deals = l.snackDeal || {};
+    act
+      .filter((i) => SLOT_MOMENT[i] === 'C' && !noted(i) && !isFull(i) && !(i in out))
+      .forEach((i) => {
+        const k = Math.round(mealBaseKcal(date, i) * pf),
+          d = deals[i];
+        if (d === 'skip' || d === 'half') {
+          const r = Math.min(extra, d === 'skip' ? k : Math.floor(k / 2));
+          if (r > 0) {
+            out[i] = r;
+            extra -= r;
+          }
+        } else if (!d && l.snackOffer === undefined && extra > REBAL_TOL) l.snackOffer = i;
+      });
+  }
+  if (extra > REBAL_TOL) {
+    const rem = act.filter((i) => SLOT_MOMENT[i] !== 'C' && !noted(i) && !isFull(i) && !(i in out)),
+      base = rem.map((i) => Math.round(mealBaseKcal(date, i) * pf)),
+      total = base.reduce((a, b) => a + b, 0);
+    let todo = extra;
+    rem.forEach((i, j) => {
+      const r = total ? Math.min(Math.floor(base[j] * REBAL_MAX), Math.round((extra * base[j]) / total), todo) : 0;
+      if (r > 0) {
+        out[i] = r;
+        todo -= r;
+      }
+    });
+    left = Math.max(0, todo);
+  }
+  if (Object.keys(out).length) l.rebal = out;
+  else delete l.rebal;
+  if (left > 0) l.carryOut = Math.round(left);
+  else delete l.carryOut;
+  const cap = CARRY_DAYS * CARRY_MAX;
+  return {
+    extra: Math.max(0, Math.round(extra)),
+    carried: Math.round(Math.min(left, cap)),
+    lost: Math.round(Math.max(0, left - cap)),
+    offer: l.snackOffer,
+  };
+}
+// excédent reçu des jours précédents : jour J−k donne au plus 100 kcal, à partir de son reste
+function carryIn(date) {
+  let c = 0;
+  for (let k = 1; k <= CARRY_DAYS; k++) {
+    const out = num(data.logs?.[shiftDate(date, -k)]?.carryOut);
+    c += Math.max(0, Math.min(CARRY_MAX, out - CARRY_MAX * (k - 1)));
+  }
+  return c;
+}
+function customDetailsText(date, i, code) {
+  const r = data.customRecipes[code],
+    side = r.sauce ? r.side || 'taro' : '',
+    target = slotKcal(date, i, code);
+  if (altMode(date, i) !== 'fit') {
+    const n = altParts(date, i),
+      sf = side ? FOODS[side] : null,
+      name = r.nom.split(' (')[0].toLowerCase(),
+      parts = num(r.parts),
+      sauce =
+        parts > 0
+          ? `${partsLabel(n)} de ${name} (${Number.isInteger(n) ? n : String(n).replace('.', ',')}/${parts} de la marmite)`
+          : `${partsLabel(n)} de ${name}`;
+    return `${sauce}${sf ? ` + ${sf.units[1][1]} g de ${sf.nom.toLowerCase()} (${sf.units[1][0]})` : ''} : ≈ ${fmtK(target)} kcal.`;
+  }
+  const p = portionFor(r, target, side, side ? 2 / 3 : 1);
+  return `Portion ajustée au repas prévu (≈ ${fmtK(target)} kcal) : ${portionText(r, p, side)}.`;
+}
+// non compensé ce jour-là (au-delà de ce que les 3 jours suivants absorbent)
+function uncompensated(date) {
+  return Math.max(0, num(data.logs[date]?.carryOut) - CARRY_DAYS * CARRY_MAX);
+}
+function snackOfferHTML(date) {
+  const l = data.logs[date],
+    i = l?.snackOffer;
+  if (i === undefined || i === null) return '';
+  const k = Math.round(mealBaseKcal(date, i) * portionFactor(date)),
+    name = SLOTS[i].split(' · ')[0].toLowerCase();
+  return `<div class="alert info" data-snack-offer>⚖️ Ton repas dépasse le prévu. Tu peux alléger ta <b>${esc(name)}</b> (≈ ${fmtK(k)} kcal) pour rester dans ta journée.${isBreastfeeding() ? ' Pendant l’allaitement, on la réduit sans la supprimer.' : ''}<div class="row wrap" style="margin-top:8px">${isBreastfeeding() ? '' : `<button type="button" data-snack="skip">La sauter (−${fmtK(k)})</button>`}<button type="button" data-snack="half">La réduire de moitié (−${fmtK(Math.floor(k / 2))})</button><button type="button" data-snack="no">Non, je la garde</button></div></div>`;
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-snack]');
+  if (!b) return;
+  const l = logFor(selectedDate),
+    i = l.snackOffer;
+  if (i === undefined) return;
+  l.snackDeal = {...(l.snackDeal || {}), [i]: b.dataset.snack};
+  const r = computeRebalance(selectedDate);
+  save();
+  renderToday();
+  toast(
+    r.lost
+      ? `${fmtK(r.lost)} kcal ne peuvent pas être compensés : ce n’est pas grave une fois, c’est la semaine qui compte.`
+      : r.carried
+        ? `${fmtK(r.carried)} kcal seront étalés sur les jours suivants.`
+        : 'Ta journée est rééquilibrée.',
+  );
+});
